@@ -1,0 +1,266 @@
+package process
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+type Service struct {
+	Pid         uint32
+	Name        string
+	Cmdline     string
+	ContainerID string
+	Namespace   string
+	Labels      map[string]string
+}
+
+type Mapper struct {
+	mu       sync.RWMutex
+	services map[uint32]*Service
+	byName   map[string][]*Service
+	byPort   map[uint16]*Service
+}
+
+func NewMapper() *Mapper {
+	return &Mapper{
+		services: make(map[uint32]*Service),
+		byName:   make(map[string][]*Service),
+		byPort:   make(map[uint16]*Service),
+	}
+}
+
+func (m *Mapper) Refresh() error {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return fmt.Errorf("read /proc: %w", err)
+	}
+
+	newServices := make(map[uint32]*Service)
+	newByName := make(map[string][]*Service)
+	newByPort := make(map[uint16]*Service)
+
+	for _, proc := range procs {
+		if !proc.IsDir() {
+			continue
+		}
+
+		pid, err := strconv.ParseUint(proc.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+
+		svc, err := m.inspectProcess(uint32(pid))
+		if err != nil {
+			continue
+		}
+		if svc == nil {
+			continue
+		}
+
+		newServices[svc.Pid] = svc
+		newByName[svc.Name] = append(newByName[svc.Name], svc)
+	}
+
+	m.mu.Lock()
+	m.services = newServices
+	m.byName = newByName
+	m.byPort = newByPort
+	m.mu.Unlock()
+
+	m.discoverListeners()
+	return nil
+}
+
+func (m *Mapper) inspectProcess(pid uint32) (*Service, error) {
+	procPath := fmt.Sprintf("/proc/%d", pid)
+
+	comm, err := os.ReadFile(filepath.Join(procPath, "comm"))
+	if err != nil {
+		return nil, err
+	}
+	name := strings.TrimSpace(string(comm))
+
+	cmdlineBytes, err := os.ReadFile(filepath.Join(procPath, "cmdline"))
+	if err != nil {
+		return nil, err
+	}
+	cmdline := strings.ReplaceAll(string(cmdlineBytes), "\x00", " ")
+	cmdline = strings.TrimSpace(cmdline)
+
+	svc := &Service{
+		Pid:     pid,
+		Name:    m.resolveServiceName(pid, name, cmdline),
+		Cmdline: cmdline,
+		Labels:  make(map[string]string),
+	}
+
+	cgroup, err := os.ReadFile(filepath.Join(procPath, "cgroup"))
+	if err == nil {
+		svc.ContainerID = extractContainerID(string(cgroup))
+	}
+
+	netNS, err := os.Readlink(filepath.Join(procPath, "ns", "net"))
+	if err == nil {
+		svc.Namespace = strings.Trim(netNS, "[]")
+	}
+
+	return svc, nil
+}
+
+func (m *Mapper) resolveServiceName(pid uint32, comm, cmdline string) string {
+	envPath := fmt.Sprintf("/proc/%d/environ", pid)
+	envBytes, err := os.ReadFile(envPath)
+	if err == nil {
+		envs := strings.Split(string(envBytes), "\x00")
+		for _, env := range envs {
+			if strings.HasPrefix(env, "SERVICE_NAME=") {
+				return strings.TrimPrefix(env, "SERVICE_NAME=")
+			}
+			if strings.HasPrefix(env, "APP_NAME=") {
+				return strings.TrimPrefix(env, "APP_NAME=")
+			}
+		}
+	}
+
+	if m.isSystemdService(pid) {
+		return comm
+	}
+
+	if idx := strings.Index(cmdline, " "); idx > 0 {
+		bin := filepath.Base(cmdline[:idx])
+		return sanitizeServiceName(bin)
+	}
+	return sanitizeServiceName(comm)
+}
+
+func (m *Mapper) isSystemdService(pid uint32) bool {
+	cgroupPath := fmt.Sprintf("/proc/%d/cgroup", pid)
+	data, err := os.ReadFile(cgroupPath)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "systemd")
+}
+
+func (m *Mapper) discoverListeners() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+
+	for _, proc := range procs {
+		if !proc.IsDir() {
+			continue
+		}
+		pid, err := strconv.ParseUint(proc.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+
+		tcpPath := fmt.Sprintf("/proc/%d/net/tcp", pid)
+		f, err := os.Open(tcpPath)
+		if err != nil {
+			continue
+		}
+
+		scanner := bufio.NewScanner(f)
+		scanner.Scan()
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 4 {
+				continue
+			}
+			if fields[3] != "0A" {
+				continue
+			}
+
+			localAddr := fields[1]
+			colonIdx := strings.LastIndex(localAddr, ":")
+			if colonIdx < 0 {
+				continue
+			}
+			portHex := localAddr[colonIdx+1:]
+			port, err := strconv.ParseUint(portHex, 16, 16)
+			if err != nil {
+				continue
+			}
+
+			if svc, ok := m.services[uint32(pid)]; ok {
+				m.byPort[uint16(port)] = svc
+			}
+		}
+		f.Close()
+	}
+}
+
+func (m *Mapper) FindByPid(pid uint32) *Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.services[pid]
+}
+
+func (m *Mapper) FindByPort(port uint16) *Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.byPort[port]
+}
+
+func (m *Mapper) FindByName(name string) []*Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.byName[name]
+}
+
+func (m *Mapper) AllServices() map[uint32]*Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make(map[uint32]*Service, len(m.services))
+	for k, v := range m.services {
+		result[k] = v
+	}
+	return result
+}
+
+func (m *Mapper) FindByContainerID(containerID string) *Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, svc := range m.services {
+		if svc.ContainerID == containerID {
+			return svc
+		}
+	}
+	return nil
+}
+
+func extractContainerID(cgroup string) string {
+	lines := strings.Split(cgroup, "\n")
+	for _, line := range lines {
+		parts := strings.Split(line, "/")
+		for _, part := range parts {
+			if len(part) >= 12 && isHex(part[:12]) {
+				return part[:12]
+			}
+		}
+	}
+	return ""
+}
+
+func isHex(s string) bool {
+	_, err := strconv.ParseUint(s, 16, 64)
+	return err == nil
+}
+
+func sanitizeServiceName(name string) string {
+	name = strings.TrimPrefix(name, "./")
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	return strings.ToLower(name)
+}

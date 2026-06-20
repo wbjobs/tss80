@@ -23,6 +23,9 @@ var (
 	refreshInterval time.Duration
 	bytecodeFile    string
 	showVersion     bool
+	watchMode       bool
+	watchInterval   time.Duration
+	idleTTL         time.Duration
 )
 
 var Version = "0.1.0"
@@ -36,17 +39,27 @@ generating topology graphs (DOT or JSON format).
 
 No application code changes or extra API endpoints are required.
 The tool traces connect/accept/close syscalls to build a complete
-picture of which services communicate with each other over the network.`,
+picture of which services communicate with each other over the network.
+
+Both TCP/IP and Unix Domain Socket (UDS) connections are supported.
+
+Two modes are available:
+  - Static mode (default): Capture for a duration, then output full topology once
+  - Watch mode (--watch): Continuously output incremental topology changes`,
 	RunE: runTrace,
 }
 
 func init() {
-	rootCmd.Flags().StringVarP(&outputFormat, "format", "f", "dot", "Output format: dot or json")
+	rootCmd.Flags().StringVarP(&outputFormat, "format", "f", "dot", "Output format: dot, json, or text")
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path (default: stdout)")
 	rootCmd.Flags().DurationVarP(&duration, "duration", "d", 0, "Trace duration (0 = run until interrupted)")
 	rootCmd.Flags().DurationVar(&refreshInterval, "refresh", 5*time.Second, "Process/service mapping refresh interval")
 	rootCmd.Flags().StringVarP(&bytecodeFile, "bytecode", "b", "", "Path to pre-compiled eBPF bytecode (.o file)")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Print version information")
+
+	rootCmd.Flags().BoolVar(&watchMode, "watch", false, "Enable incremental update mode (periodically output topology changes)")
+	rootCmd.Flags().DurationVar(&watchInterval, "interval", 10*time.Second, "Incremental update interval in watch mode")
+	rootCmd.Flags().DurationVar(&idleTTL, "idle-ttl", 2*time.Minute, "Idle TTL after which an edge with no activity is considered removed")
 
 	rootCmd.AddCommand(&cobra.Command{
 		Use:   "version",
@@ -73,6 +86,11 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "[*] Starting eBPF-based microservice topology tracer v%s\n", Version)
+	if watchMode {
+		fmt.Fprintf(os.Stderr, "[*] Mode: WATCH (incremental updates every %s)\n", watchInterval)
+	} else {
+		fmt.Fprintf(os.Stderr, "[*] Mode: STATIC (full topology output)\n")
+	}
 	fmt.Fprintf(os.Stderr, "[*] Output format: %s\n", outputFormat)
 
 	mgr := ebpf.NewManager()
@@ -110,6 +128,17 @@ func runTrace(cmd *cobra.Command, args []string) error {
 	refreshTicker := time.NewTicker(refreshInterval)
 	defer refreshTicker.Stop()
 
+	var watchTickerChan <-chan time.Time
+	watcher := topology.NewGraphWatcher(graph)
+	watcher.SetEdgeIdleTTL(idleTTL)
+	if watchMode {
+		watchTicker := time.NewTicker(watchInterval)
+		defer watchTicker.Stop()
+		watchTickerChan = watchTicker.C
+
+		fmt.Fprintf(os.Stderr, "\n[*] Watch mode initial snapshot will be taken in %s...\n", watchInterval)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -118,7 +147,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 		timeout = time.After(duration)
 	}
 
-	fmt.Fprintf(os.Stderr, "[*] Tracing network connections... (Press Ctrl+C to stop)\n")
+	fmt.Fprintf(os.Stderr, "[*] Tracing network connections... (Press Ctrl+C to stop)\n\n")
 
 loop:
 	for {
@@ -134,6 +163,12 @@ loop:
 		case <-refreshTicker.C:
 			if err := mapper.Refresh(); err != nil {
 				fmt.Fprintf(os.Stderr, "[!] Service refresh error: %v\n", err)
+			}
+			watcher.CheckTTL()
+
+		case <-watchTickerChan:
+			if err := handleWatchTick(watcher); err != nil {
+				fmt.Fprintf(os.Stderr, "[!] Watch tick error: %v\n", err)
 			}
 
 		default:
@@ -160,8 +195,67 @@ loop:
 		}
 	}
 
+	if watchMode {
+		fmt.Fprintf(os.Stderr, "\n[*] Final incremental update...\n")
+		if err := handleWatchTick(watcher); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Final watch tick error: %v\n", err)
+		}
+	}
+
 	fmt.Fprintf(os.Stderr, "[*] Generating topology output...\n")
-	return writeOutput(graph)
+	return writeOutput(graph, watcher)
+}
+
+func handleWatchTick(watcher *topology.GraphWatcher) error {
+	update := watcher.CollectIncremental()
+
+	writer, closer, err := getWriter()
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer closer()
+	}
+
+	if watchMode {
+		fmt.Fprintf(writer, "========================================\n")
+	}
+
+	switch outputFormat {
+	case "dot":
+		update.ToDOTDelta(writer)
+	case "json":
+		if err := update.ToJSON(writer); err != nil {
+			return fmt.Errorf("write JSON delta: %w", err)
+		}
+		fmt.Fprintln(writer)
+	case "text":
+		update.ToText(writer)
+	default:
+		return fmt.Errorf("unsupported output format: %s (use 'dot', 'json', or 'text')", outputFormat)
+	}
+
+	if watchMode {
+		fmt.Fprintf(writer, "========================================\n\n")
+	}
+
+	return nil
+}
+
+func getWriter() (*os.File, func(), error) {
+	if outputFile != "" {
+		dir := filepath.Dir(outputFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, nil, fmt.Errorf("create output directory: %w", err)
+		}
+		f, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open output file: %w", err)
+		}
+		closer := func() { f.Close() }
+		return f, closer, nil
+	}
+	return os.Stdout, nil, nil
 }
 
 func checkPrivileges() error {
@@ -174,21 +268,17 @@ func checkPrivileges() error {
 	return nil
 }
 
-func writeOutput(graph *topology.Graph) error {
-	var writer *os.File
-	if outputFile != "" {
-		dir := filepath.Dir(outputFile)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("create output directory: %w", err)
-		}
-		f, err := os.Create(outputFile)
-		if err != nil {
-			return fmt.Errorf("create output file: %w", err)
-		}
-		defer f.Close()
-		writer = f
-	} else {
-		writer = os.Stdout
+func writeOutput(graph *topology.Graph, watcher *topology.GraphWatcher) error {
+	if watchMode {
+		return nil
+	}
+
+	writer, closer, err := getWriter()
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer closer()
 	}
 
 	switch outputFormat {
@@ -198,6 +288,8 @@ func writeOutput(graph *topology.Graph) error {
 		if err := graph.ToJSON(writer); err != nil {
 			return fmt.Errorf("write JSON: %w", err)
 		}
+	case "text":
+		return fmt.Errorf("text format is only available in watch mode (use --watch)")
 	default:
 		return fmt.Errorf("unsupported output format: %s (use 'dot' or 'json')", outputFormat)
 	}

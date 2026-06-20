@@ -19,18 +19,33 @@ type Service struct {
 	Labels      map[string]string
 }
 
+type UnixSocketInfo struct {
+	Inode  uint64
+	Path   string
+	Pid    uint32
+	Flags  string
+	RefCnt string
+}
+
 type Mapper struct {
 	mu       sync.RWMutex
 	services map[uint32]*Service
 	byName   map[string][]*Service
 	byPort   map[uint16]*Service
+
+	bySocketPath map[string]*Service
+	bySocketInode map[uint64]*UnixSocketInfo
+	inodeToPath   map[uint64]string
 }
 
 func NewMapper() *Mapper {
 	return &Mapper{
-		services: make(map[uint32]*Service),
-		byName:   make(map[string][]*Service),
-		byPort:   make(map[uint16]*Service),
+		services:      make(map[uint32]*Service),
+		byName:        make(map[string][]*Service),
+		byPort:        make(map[uint16]*Service),
+		bySocketPath:  make(map[string]*Service),
+		bySocketInode: make(map[uint64]*UnixSocketInfo),
+		inodeToPath:   make(map[uint64]string),
 	}
 }
 
@@ -70,9 +85,13 @@ func (m *Mapper) Refresh() error {
 	m.services = newServices
 	m.byName = newByName
 	m.byPort = newByPort
+	m.bySocketPath = make(map[string]*Service)
+	m.bySocketInode = make(map[uint64]*UnixSocketInfo)
+	m.inodeToPath = make(map[uint64]string)
 	m.mu.Unlock()
 
 	m.discoverListeners()
+	m.discoverUnixSockets()
 	return nil
 }
 
@@ -201,6 +220,112 @@ func (m *Mapper) discoverListeners() {
 	}
 }
 
+func (m *Mapper) discoverUnixSockets() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.bySocketInode = make(map[uint64]*UnixSocketInfo)
+	m.inodeToPath = make(map[uint64]string)
+	m.bySocketPath = make(map[string]*Service)
+
+	unixPath := "/proc/net/unix"
+	f, err := os.Open(unixPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Scan()
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 7 {
+			continue
+		}
+
+		inodeStr := fields[6]
+		inode, err := strconv.ParseUint(inodeStr, 10, 64)
+		if err != nil {
+			continue
+		}
+
+		path := ""
+		if len(fields) > 7 {
+			path = fields[7]
+		}
+
+		info := &UnixSocketInfo{
+			Inode:  inode,
+			Path:   path,
+			Flags:  fields[2],
+			RefCnt: fields[3],
+		}
+
+		m.bySocketInode[inode] = info
+		if path != "" {
+			m.inodeToPath[inode] = path
+		}
+	}
+
+	m.mapUnixSocketsToPids()
+}
+
+func (m *Mapper) mapUnixSocketsToPids() {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+
+	for _, proc := range procs {
+		if !proc.IsDir() {
+			continue
+		}
+		pid, err := strconv.ParseUint(proc.Name(), 10, 32)
+		if err != nil {
+			continue
+		}
+
+		fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+		fdEntries, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+
+		for _, fdEntry := range fdEntries {
+			fdLink := filepath.Join(fdDir, fdEntry.Name())
+			target, err := os.Readlink(fdLink)
+			if err != nil {
+				continue
+			}
+
+			if strings.HasPrefix(target, "socket:[") {
+				inodeStr := strings.TrimPrefix(strings.TrimSuffix(target, "]"), "socket:[")
+				inode, err := strconv.ParseUint(inodeStr, 10, 64)
+				if err != nil {
+					continue
+				}
+
+				if info, ok := m.bySocketInode[inode]; ok {
+					info.Pid = uint32(pid)
+
+					if info.Path != "" {
+						if svc, svcOk := m.services[uint32(pid)]; svcOk {
+							m.bySocketPath[info.Path] = svc
+						}
+					}
+				}
+
+				if path, ok := m.inodeToPath[inode]; ok && path != "" {
+					if svc, svcOk := m.services[uint32(pid)]; svcOk {
+						m.bySocketPath[path] = svc
+					}
+				}
+			}
+		}
+	}
+}
+
 func (m *Mapper) FindByPid(pid uint32) *Service {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -238,6 +363,24 @@ func (m *Mapper) FindByContainerID(containerID string) *Service {
 		}
 	}
 	return nil
+}
+
+func (m *Mapper) FindByUnixSocketPath(path string) *Service {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bySocketPath[path]
+}
+
+func (m *Mapper) FindUnixSocketInfo(inode uint64) *UnixSocketInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bySocketInode[inode]
+}
+
+func (m *Mapper) GetSocketPathByInode(inode uint64) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.inodeToPath[inode]
 }
 
 func extractContainerID(cgroup string) string {

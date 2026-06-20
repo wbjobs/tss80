@@ -9,21 +9,36 @@ import (
 )
 
 const (
-	EventTypeConnect = iota
-	EventTypeAccept
-	EventTypeClose
+	EventTypeInetConnect = 1
+	EventTypeInetAccept  = 2
+	EventTypeUnixConnect = 3
+	EventTypeUnixAccept  = 4
+	EventTypeClose       = 5
 )
 
+const (
+	MaxSunPath = 108
+	MaxCommLen = 64
+)
+
+type EventHeader struct {
+	EventType uint32
+	Pid       uint32
+	Tid       uint32
+	Comm      [MaxCommLen]byte
+}
+
 type Event struct {
-	Type    int
-	Pid     uint32
-	Tid     uint32
-	Saddr   net.IP
-	Daddr   net.IP
-	Sport   uint16
-	Dport   uint16
-	Fd      uint64
-	Comm    string
+	Type        uint32
+	Pid         uint32
+	Tid         uint32
+	Saddr       net.IP
+	Daddr       net.IP
+	Sport       uint16
+	Dport       uint16
+	Fd          uint64
+	Comm        string
+	SunPath     string
 }
 
 type Parser struct {
@@ -37,38 +52,56 @@ func NewParser() *Parser {
 }
 
 func (p *Parser) Parse(raw []byte) (*Event, error) {
-	if len(raw) < 8 {
+	if len(raw) < 4 {
 		return nil, fmt.Errorf("raw sample too small: %d bytes", len(raw))
 	}
 
-	if len(raw) == 80 {
-		return p.parseConnect(raw)
-	} else if len(raw) == 80 {
-		return p.parseAccept(raw)
-	} else if len(raw) == 80 {
+	eventType := p.byteOrder.Uint32(raw[0:4])
+
+	switch eventType {
+	case EventTypeInetConnect:
+		return p.parseInetConnect(raw)
+	case EventTypeInetAccept:
+		return p.parseInetAccept(raw)
+	case EventTypeUnixConnect:
+		return p.parseUnixConnect(raw)
+	case EventTypeUnixAccept:
+		return p.parseUnixAccept(raw)
+	case EventTypeClose:
 		return p.parseClose(raw)
+	default:
+		return nil, fmt.Errorf("unknown event type: %d (size=%d)", eventType, len(raw))
 	}
-
-	if len(raw) >= 76 {
-		return p.parseConnect(raw)
-	}
-
-	return nil, fmt.Errorf("unknown event size: %d", len(raw))
 }
 
-func (p *Parser) parseConnect(raw []byte) (*Event, error) {
+func (p *Parser) parseHeader(r *bytes.Reader) (*EventHeader, error) {
+	var hdr EventHeader
+	if err := binary.Read(r, p.byteOrder, &hdr.EventType); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, p.byteOrder, &hdr.Pid); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, p.byteOrder, &hdr.Tid); err != nil {
+		return nil, err
+	}
+	if err := binary.Read(r, p.byteOrder, &hdr.Comm); err != nil {
+		return nil, err
+	}
+	return &hdr, nil
+}
+
+func (p *Parser) parseInetConnect(raw []byte) (*Event, error) {
 	r := bytes.NewReader(raw)
-	var pid, tid uint32
+	hdr, err := p.parseHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
 	var saddr, daddr uint32
 	var sport, dport uint16
-	var comm [64]byte
+	var padding uint32
 
-	if err := binary.Read(r, p.byteOrder, &pid); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, p.byteOrder, &tid); err != nil {
-		return nil, err
-	}
 	if err := binary.Read(r, p.byteOrder, &saddr); err != nil {
 		return nil, err
 	}
@@ -81,35 +114,33 @@ func (p *Parser) parseConnect(raw []byte) (*Event, error) {
 	if err := binary.Read(r, p.byteOrder, &dport); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(r, p.byteOrder, &comm); err != nil {
+	if err := binary.Read(r, p.byteOrder, &padding); err != nil {
 		return nil, err
 	}
 
 	return &Event{
-		Type:  EventTypeConnect,
-		Pid:   pid,
-		Tid:   tid,
+		Type:  hdr.EventType,
+		Pid:   hdr.Pid,
+		Tid:   hdr.Tid,
 		Saddr: uint32ToIP(saddr),
 		Daddr: uint32ToIP(daddr),
 		Sport: sport,
 		Dport: dport,
-		Comm:  strings.TrimRight(string(comm[:]), "\x00"),
+		Comm:  trimNulls(hdr.Comm[:]),
 	}, nil
 }
 
-func (p *Parser) parseAccept(raw []byte) (*Event, error) {
+func (p *Parser) parseInetAccept(raw []byte) (*Event, error) {
 	r := bytes.NewReader(raw)
-	var pid, tid uint32
+	hdr, err := p.parseHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
 	var saddr, daddr uint32
 	var sport, dport uint16
-	var comm [64]byte
+	var padding uint32
 
-	if err := binary.Read(r, p.byteOrder, &pid); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, p.byteOrder, &tid); err != nil {
-		return nil, err
-	}
 	if err := binary.Read(r, p.byteOrder, &saddr); err != nil {
 		return nil, err
 	}
@@ -122,48 +153,97 @@ func (p *Parser) parseAccept(raw []byte) (*Event, error) {
 	if err := binary.Read(r, p.byteOrder, &dport); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(r, p.byteOrder, &comm); err != nil {
+	if err := binary.Read(r, p.byteOrder, &padding); err != nil {
 		return nil, err
 	}
 
 	return &Event{
-		Type:  EventTypeAccept,
-		Pid:   pid,
-		Tid:   tid,
+		Type:  hdr.EventType,
+		Pid:   hdr.Pid,
+		Tid:   hdr.Tid,
 		Saddr: uint32ToIP(saddr),
 		Daddr: uint32ToIP(daddr),
 		Sport: sport,
 		Dport: dport,
-		Comm:  strings.TrimRight(string(comm[:]), "\x00"),
+		Comm:  trimNulls(hdr.Comm[:]),
+	}, nil
+}
+
+func (p *Parser) parseUnixConnect(raw []byte) (*Event, error) {
+	r := bytes.NewReader(raw)
+	hdr, err := p.parseHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var sunPath [MaxSunPath]byte
+	if err := binary.Read(r, p.byteOrder, &sunPath); err != nil {
+		return nil, err
+	}
+
+	var padding uint32
+	if err := binary.Read(r, p.byteOrder, &padding); err != nil {
+		return nil, err
+	}
+
+	return &Event{
+		Type:    hdr.EventType,
+		Pid:     hdr.Pid,
+		Tid:     hdr.Tid,
+		Comm:    trimNulls(hdr.Comm[:]),
+		SunPath: trimNulls(sunPath[:]),
+	}, nil
+}
+
+func (p *Parser) parseUnixAccept(raw []byte) (*Event, error) {
+	r := bytes.NewReader(raw)
+	hdr, err := p.parseHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
+	var sunPath [MaxSunPath]byte
+	if err := binary.Read(r, p.byteOrder, &sunPath); err != nil {
+		return nil, err
+	}
+
+	var padding uint32
+	if err := binary.Read(r, p.byteOrder, &padding); err != nil {
+		return nil, err
+	}
+
+	return &Event{
+		Type:    hdr.EventType,
+		Pid:     hdr.Pid,
+		Tid:     hdr.Tid,
+		Comm:    trimNulls(hdr.Comm[:]),
+		SunPath: trimNulls(sunPath[:]),
 	}, nil
 }
 
 func (p *Parser) parseClose(raw []byte) (*Event, error) {
 	r := bytes.NewReader(raw)
-	var pid, tid uint32
-	var fd uint64
-	var comm [64]byte
+	hdr, err := p.parseHeader(r)
+	if err != nil {
+		return nil, err
+	}
 
-	if err := binary.Read(r, p.byteOrder, &pid); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, p.byteOrder, &tid); err != nil {
-		return nil, err
-	}
+	var fd uint64
 	if err := binary.Read(r, p.byteOrder, &fd); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(r, p.byteOrder, &comm); err != nil {
 		return nil, err
 	}
 
 	return &Event{
-		Type: EventTypeClose,
-		Pid:  pid,
-		Tid:  tid,
+		Type: hdr.EventType,
+		Pid:  hdr.Pid,
+		Tid:  hdr.Tid,
 		Fd:   fd,
-		Comm: strings.TrimRight(string(comm[:]), "\x00"),
+		Comm: trimNulls(hdr.Comm[:]),
 	}, nil
+}
+
+func trimNulls(b []byte) string {
+	return strings.TrimRight(string(b), "\x00")
 }
 
 func uint32ToIP(v uint32) net.IP {
